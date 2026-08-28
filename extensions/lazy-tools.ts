@@ -65,6 +65,8 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 	let groupIndex: GroupIndex = new GroupIndex([]);
 	/** Debug logging to /tmp/lazy-tools-debug.log */
 	let debugLogging = false;
+	let sessionGeneration = 0;
+	let stopAsyncToolWatch: (() => void) | undefined;
 
 	function debugLog(line: string): void {
 		if (!debugLogging) return;
@@ -186,7 +188,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 	 * If tool hash matches config, uses cached groups. Otherwise re-runs LLM.
 	 * Updates toolGroups, config, and status.
 	 */
-	async function runLlmCategorization(ctx: ExtensionContext): Promise<boolean> {
+	async function runLlmCategorization(ctx: ExtensionContext, isCurrent = () => true): Promise<boolean> {
 		if (!config?.categorizationModel) return false;
 
 		const allTools = pi.getAllTools();
@@ -209,6 +211,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		ctx.ui.setStatus("lazy-tools", `⚡ Recategorizing ${toolCount} tools...`);
 
 		const parsed = await categorizationWithModel(model, ctx);
+		if (!isCurrent()) return false;
 		if (parsed) {
 			toolGroups = parsed;
 			rebuildIndex();
@@ -732,6 +735,8 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 	// ── Session Lifecycle ─────────────────────────────────────────────────
 
 	pi.on("session_start", async (event, ctx) => {
+		const generation = ++sessionGeneration;
+		stopAsyncToolWatch?.();
 		hasReconciled = false;
 
 		// Check --lazy flag
@@ -857,12 +862,12 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		// Wait for async tool registrations (e.g. vault MCP discovery) before
 		// merging late tools and persisting the complete registry hash.
 		if (config) {
-			watchForAsyncTools({
+			stopAsyncToolWatch = watchForAsyncTools({
 				getToolCount: () => pi.getAllTools().length,
 				onSettled: async () => {
 					const stableHash = computeToolHash(pi.getAllTools());
 					if (config!.toolHash !== stableHash) {
-						const recategorized = await runLlmCategorization(ctx);
+						const recategorized = await runLlmCategorization(ctx, () => generation === sessionGeneration);
 						if (!recategorized) return;
 						if (ctx.hasUI) await runSetupWizard(ctx);
 					}
@@ -877,6 +882,12 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 				},
 			});
 		}
+	});
+
+	pi.on("session_shutdown", () => {
+		sessionGeneration++;
+		stopAsyncToolWatch?.();
+		stopAsyncToolWatch = undefined;
 	});
 
 	// Restore on tree navigation

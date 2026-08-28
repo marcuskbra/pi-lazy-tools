@@ -50,8 +50,14 @@ describe("categorization runtime", () => {
 		assert.match(lazyToolsExtensionSource, /onSettled:\s*async\s*\(\)\s*=>/);
 		assert.match(lazyToolsExtensionSource, /const stableHash = computeToolHash\(pi\.getAllTools\(\)\)/);
 		assert.match(lazyToolsExtensionSource, /if \(config!\.toolHash !== stableHash\)/);
-		assert.match(lazyToolsExtensionSource, /const recategorized = await runLlmCategorization\(ctx\)/);
+		assert.match(lazyToolsExtensionSource, /const recategorized = await runLlmCategorization\(ctx, \(\) => generation === sessionGeneration\)/);
 		assert.doesNotMatch(lazyToolsExtensionSource, /else if \(config\.toolHash !== currentHash\)/);
+	});
+
+	it("cancels and ignores async work after session replacement", () => {
+		assert.match(lazyToolsExtensionSource, /pi\.on\("session_shutdown"/);
+		assert.match(lazyToolsExtensionSource, /stopAsyncToolWatch\?\.\(\)/);
+		assert.match(lazyToolsExtensionSource, /runLlmCategorization\(ctx, \(\) => generation === sessionGeneration\)/);
 	});
 });
 
