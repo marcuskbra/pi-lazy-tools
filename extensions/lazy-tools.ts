@@ -860,6 +860,13 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 			watchForAsyncTools({
 				getToolCount: () => pi.getAllTools().length,
 				onSettled: async () => {
+					const stableHash = computeToolHash(pi.getAllTools());
+					if (config!.toolHash !== stableHash) {
+						const recategorized = await runLlmCategorization(ctx);
+						if (!recategorized) return;
+						if (ctx.hasUI) await runSetupWizard(ctx);
+					}
+
 					const result = mergeLateToolsIntoConfig(config!, toolGroups, pi.getAllTools());
 					config = result.config;
 					toolGroups = result.toolGroups;

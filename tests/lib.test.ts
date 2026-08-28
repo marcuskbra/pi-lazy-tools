@@ -48,6 +48,9 @@ describe("categorization runtime", () => {
 
 	it("waits for tool registration to settle before persisting cached groups", () => {
 		assert.match(lazyToolsExtensionSource, /onSettled:\s*async\s*\(\)\s*=>/);
+		assert.match(lazyToolsExtensionSource, /const stableHash = computeToolHash\(pi\.getAllTools\(\)\)/);
+		assert.match(lazyToolsExtensionSource, /if \(config!\.toolHash !== stableHash\)/);
+		assert.match(lazyToolsExtensionSource, /const recategorized = await runLlmCategorization\(ctx\)/);
 		assert.doesNotMatch(lazyToolsExtensionSource, /else if \(config\.toolHash !== currentHash\)/);
 	});
 });
