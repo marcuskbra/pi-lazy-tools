@@ -46,6 +46,8 @@ export interface LazyToolsConfig {
 	passthrough?: PassthroughConfig;
 	/** Tuning for the LLM categorization prompt. */
 	categorization?: CategorizationConfig;
+	/** Write lazy-tools diagnostic events to /tmp/lazy-tools-debug.log. */
+	debugLogging?: boolean;
 	/**
 	 * Run LLM categorization off the awaited startup path on the
 	 * tool-set-changed and first-run paths. Opt-in (default off): when enabled,
@@ -947,6 +949,10 @@ export function buildDefaultConfig(
  * Merge LLM-generated groups into an existing config.
  * Preserves user mode preferences for existing groups, defaults new ones to on-demand.
  */
+export function withDebugLogging(config: LazyToolsConfig, enabled: boolean): LazyToolsConfig {
+	return { ...config, debugLogging: enabled };
+}
+
 export function mergeLateToolsIntoConfig(
 	config: LazyToolsConfig,
 	currentGroups: ToolGroup[],

@@ -43,6 +43,7 @@ import {
 	parseCategorizationResponse,
 	mergeGroupsIntoConfig,
 	mergeLateToolsIntoConfig,
+	withDebugLogging,
 	autoSelectCategorizationModel,
 	shouldPassthrough,
 	shouldBackgroundCategorize,
@@ -661,6 +662,10 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		description: "Toggle debug logging to /tmp/lazy-tools-debug.log",
 		handler: async (_args, ctx) => {
 			debugLogging = !debugLogging;
+			if (config) {
+				config = withDebugLogging(config, debugLogging);
+				saveConfigToPath(getConfigPath(), config);
+			}
 			if (debugLogging) {
 				try { require("fs").writeFileSync("/tmp/lazy-tools-debug.log", ""); } catch {}
 			}
@@ -749,6 +754,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 
 		// Load config
 		config = loadConfigFromPath(getConfigPath());
+		debugLogging = config?.debugLogging === true;
 		debugLog(`session_start: reason=${event.reason} hasUI=${ctx.hasUI} mode=${ctx.mode} configLoaded=${config !== null} configPath=${getConfigPath()}`);
 
 		// Passthrough: in spawned agents (e.g. team teammates/subagents) and

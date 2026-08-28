@@ -102,13 +102,14 @@ Saved to `~/.pi/agent/lazy-tools.json`:
     "envMarkers": ["PI_TEAM_ROLE"]
   },
   "categorization": { "minGroups": 8, "maxGroups": 12 },
-  "backgroundCategorization": { "enabled": true }
+  "backgroundCategorization": { "enabled": true },
+  "debugLogging": true
 }
 ```
 
 ## Durability and spawned agents
 
-Four opt-in settings live in the same `lazy-tools.json`. They default off, so
+Five opt-in settings live in the same `lazy-tools.json`. They default off, so
 behaviour is unchanged until you enable them. The config file is not touched by
 package updates, and a spawned teammate reads the same file, so enabling a
 setting once carries across updates and into every child pi process.
@@ -139,6 +140,12 @@ markers, such as a future `PI_SUBAGENT`, to `envMarkers` without a code change.
 The group-count target and grouping guidance handed to the categorization LLM.
 `minGroups`/`maxGroups` default to 8 and 12; set them lower for fewer, broader
 groups. `guidance` overrides the default "one service per group" bullets.
+
+### debugLogging
+
+Set `debugLogging: true` to write startup, categorization, and tool-activation
+records to `/tmp/lazy-tools-debug.log`. The `/lazy-tools-logging` command toggles
+and persists this setting. Set it to `false` after diagnosis.
 
 ### backgroundCategorization
 

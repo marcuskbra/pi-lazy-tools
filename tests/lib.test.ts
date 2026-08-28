@@ -27,6 +27,7 @@ import {
 	parseCategorizationResponse,
 	mergeGroupsIntoConfig,
 	mergeLateToolsIntoConfig,
+	withDebugLogging,
 	autoSelectCategorizationModel,
 	GroupIndex,
 	shouldPassthrough,
@@ -52,6 +53,11 @@ describe("categorization runtime", () => {
 		assert.match(lazyToolsExtensionSource, /if \(config!\.toolHash !== stableHash\)/);
 		assert.match(lazyToolsExtensionSource, /const recategorized = await runLlmCategorization\(ctx, \(\) => generation === sessionGeneration\)/);
 		assert.doesNotMatch(lazyToolsExtensionSource, /else if \(config\.toolHash !== currentHash\)/);
+	});
+
+	it("restores debug logging before session startup diagnostics", () => {
+		assert.match(lazyToolsExtensionSource, /debugLogging = config\?\.debugLogging === true/);
+		assert.match(lazyToolsExtensionSource, /withDebugLogging\(config, debugLogging\)/);
 	});
 
 	it("cancels and ignores async work after session replacement", () => {
@@ -477,6 +483,17 @@ describe("config persistence", () => {
 		const raw = JSON.parse(readFileSync(path, "utf-8"));
 		assert.equal(raw.version, 1);
 		assert.equal(typeof raw.groups, "object");
+	});
+});
+
+describe("withDebugLogging", () => {
+	it("persists debug logging without mutating the current config", () => {
+		const config = buildDefaultConfig(categorizeTools(MOCK_TOOLS));
+
+		const result = withDebugLogging(config, true);
+
+		assert.equal(result.debugLogging, true);
+		assert.equal(config.debugLogging, undefined);
 	});
 });
 
