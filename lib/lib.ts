@@ -46,6 +46,8 @@ export interface LazyToolsConfig {
 	passthrough?: PassthroughConfig;
 	/** Tuning for the LLM categorization prompt. */
 	categorization?: CategorizationConfig;
+	/** Write lazy-tools diagnostic events to /tmp/lazy-tools-debug.log. */
+	debugLogging?: boolean;
 	/**
 	 * Run LLM categorization off the awaited startup path on the
 	 * tool-set-changed and first-run paths. Opt-in (default off): when enabled,
@@ -660,7 +662,9 @@ export interface WatchForAsyncToolsOptions {
 	/** Returns the current tool count. */
 	getToolCount: () => number;
 	/** Called when new tools are detected and count has stabilized. */
-	onStabilized: () => void;
+	onStabilized?: () => void;
+	/** Called once after the tool registry stabilizes, even when it did not change. */
+	onSettled?: () => void;
 	/** Max time to poll in ms. Default: 5000. */
 	maxWaitMs?: number;
 	/** Poll interval in ms. Default: 250. */
@@ -671,7 +675,7 @@ export interface WatchForAsyncToolsOptions {
 
 /**
  * Polls for async tool registrations (e.g. vault MCP discovery) and calls
- * onStabilized once the tool count changes and then holds steady.
+ * onStabilized when the count changes, and onSettled once the count holds steady.
  * Returns a cleanup function to cancel the poll.
  */
 export function watchForAsyncTools(opts: WatchForAsyncToolsOptions): () => void {
@@ -694,13 +698,14 @@ export function watchForAsyncTools(opts: WatchForAsyncToolsOptions): () => void 
 		}
 
 		const timedOut = Date.now() - startTime > maxWaitMs;
-		const stabilized = currentCount !== initialCount && stableChecks >= stableThreshold;
+		const stabilized = stableChecks >= stableThreshold;
 
 		if (stabilized || timedOut) {
 			clearInterval(poll);
 			if (currentCount !== initialCount) {
-				opts.onStabilized();
+				opts.onStabilized?.();
 			}
+			opts.onSettled?.();
 		}
 	}, pollIntervalMs);
 
@@ -944,6 +949,34 @@ export function buildDefaultConfig(
  * Merge LLM-generated groups into an existing config.
  * Preserves user mode preferences for existing groups, defaults new ones to on-demand.
  */
+export function withDebugLogging(config: LazyToolsConfig, enabled: boolean): LazyToolsConfig {
+	return { ...config, debugLogging: enabled };
+}
+
+export function mergeLateToolsIntoConfig(
+	config: LazyToolsConfig,
+	currentGroups: ToolGroup[],
+	allTools: ToolLike[],
+): { config: LazyToolsConfig; toolGroups: ToolGroup[] } {
+	const toolGroups = currentGroups.map(group => ({ ...group, tools: [...group.tools] }));
+	const knownTools = new Set(toolGroups.flatMap(group => group.tools));
+	const lateTools = allTools.filter(tool => !knownTools.has(tool.name));
+
+	for (const newGroup of categorizeTools(lateTools)) {
+		const existingGroup = toolGroups.find(group => group.name === newGroup.name);
+		if (existingGroup) {
+			existingGroup.tools.push(...newGroup.tools);
+		} else {
+			toolGroups.push(newGroup);
+		}
+	}
+
+	return {
+		config: mergeGroupsIntoConfig(config, toolGroups, computeToolHash(allTools)),
+		toolGroups,
+	};
+}
+
 export function mergeGroupsIntoConfig(
 	config: LazyToolsConfig,
 	newGroups: ToolGroup[],

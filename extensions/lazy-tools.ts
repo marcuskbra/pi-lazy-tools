@@ -22,7 +22,6 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { DynamicBorder, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Key, type SelectItem, SelectList, type SettingItem, SettingsList, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { completeSimple } from "@earendil-works/pi-ai";
 import {
 	type GroupMode,
 	type LazyToolsConfig,
@@ -43,6 +42,8 @@ import {
 	buildCategorizationPrompt,
 	parseCategorizationResponse,
 	mergeGroupsIntoConfig,
+	mergeLateToolsIntoConfig,
+	withDebugLogging,
 	autoSelectCategorizationModel,
 	shouldPassthrough,
 	shouldBackgroundCategorize,
@@ -65,6 +66,8 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 	let groupIndex: GroupIndex = new GroupIndex([]);
 	/** Debug logging to /tmp/lazy-tools-debug.log */
 	let debugLogging = false;
+	let sessionGeneration = 0;
+	let stopAsyncToolWatch: (() => void) | undefined;
 
 	function debugLog(line: string): void {
 		if (!debugLogging) return;
@@ -149,9 +152,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		debugLog(`categorizationWithModel: model=${model?.provider}/${model?.id} toolCount=${allTools.length} toolNames=${allToolNames.join(",")}`);
 
 		try {
-			const { apiKey, headers } = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-			debugLog(`categorizationWithModel: got apiKey=${apiKey ? "yes(" + apiKey.slice(0,8) + "...)" : "NONE"} headers=${JSON.stringify(headers ?? {})}`);
-			const response = await completeSimple(
+			const response = await ctx.modelRegistry.complete(
 				model,
 				{
 					systemPrompt: prompt,
@@ -161,7 +162,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 						timestamp: Date.now(),
 					}],
 				},
-				{ maxTokens: 8192, apiKey, headers, samplingParams: thinkingOffParams(model) },
+				{ maxTokens: 8192, samplingParams: thinkingOffParams(model) },
 			);
 
 			const text = response.content
@@ -188,7 +189,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 	 * If tool hash matches config, uses cached groups. Otherwise re-runs LLM.
 	 * Updates toolGroups, config, and status.
 	 */
-	async function runLlmCategorization(ctx: ExtensionContext): Promise<boolean> {
+	async function runLlmCategorization(ctx: ExtensionContext, isCurrent = () => true): Promise<boolean> {
 		if (!config?.categorizationModel) return false;
 
 		const allTools = pi.getAllTools();
@@ -211,6 +212,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		ctx.ui.setStatus("lazy-tools", `⚡ Recategorizing ${toolCount} tools...`);
 
 		const parsed = await categorizationWithModel(model, ctx);
+		if (!isCurrent()) return false;
 		if (parsed) {
 			toolGroups = parsed;
 			rebuildIndex();
@@ -275,8 +277,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		].join("\n");
 
 		try {
-			const { apiKey, headers } = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-			const response = await completeSimple(
+			const response = await ctx.modelRegistry.complete(
 				model,
 				{
 					systemPrompt: "You are a tool group selector. Return only a JSON array.",
@@ -286,7 +287,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 						timestamp: Date.now(),
 					}],
 				},
-				{ maxTokens: 256, apiKey, headers, samplingParams: thinkingOffParams(model) },
+				{ maxTokens: 256, samplingParams: thinkingOffParams(model) },
 			);
 			const text = response.content
 				.filter((c: any) => c.type === "text")
@@ -661,6 +662,10 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		description: "Toggle debug logging to /tmp/lazy-tools-debug.log",
 		handler: async (_args, ctx) => {
 			debugLogging = !debugLogging;
+			if (config) {
+				config = withDebugLogging(config, debugLogging);
+				saveConfigToPath(getConfigPath(), config);
+			}
 			if (debugLogging) {
 				try { require("fs").writeFileSync("/tmp/lazy-tools-debug.log", ""); } catch {}
 			}
@@ -735,6 +740,8 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 	// ── Session Lifecycle ─────────────────────────────────────────────────
 
 	pi.on("session_start", async (event, ctx) => {
+		const generation = ++sessionGeneration;
+		stopAsyncToolWatch?.();
 		hasReconciled = false;
 
 		// Check --lazy flag
@@ -747,6 +754,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 
 		// Load config
 		config = loadConfigFromPath(getConfigPath());
+		debugLogging = config?.debugLogging === true;
 		debugLog(`session_start: reason=${event.reason} hasUI=${ctx.hasUI} mode=${ctx.mode} configLoaded=${config !== null} configPath=${getConfigPath()}`);
 
 		// Passthrough: in spawned agents (e.g. team teammates/subagents) and
@@ -783,7 +791,12 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 				// ── Cache hit: tools unchanged, use stored groups ──
 				toolGroups = config.toolGroups;
 				rebuildIndex();
-			} else if (config.toolHash !== currentHash) {
+			} else if (config.toolGroups) {
+				// The settled watcher will recategorize, but the session can use the
+				// previous grouping while that LLM request runs.
+				toolGroups = config.toolGroups;
+				rebuildIndex();
+			} else {
 				// ── Tools changed: re-categorize ──
 				const previousGroupNames = new Set(Object.keys(config.groups));
 				const defer = shouldBackgroundCategorize(config.backgroundCategorization);
@@ -857,44 +870,35 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		if (config) applyActiveTools();
 		updateStatus(ctx);
 
-		// Watch for async tool registrations (e.g. vault MCP discovery).
-		// When new tools appear, merge them into existing groups via prefix detection.
-		// Does NOT re-run LLM or update the config hash — that only happens
-		// during first-time setup or explicit /tools-setup.
+		// Wait for async tool registrations (e.g. vault MCP discovery) before
+		// merging late tools and persisting the complete registry hash.
 		if (config) {
-			const watchInitialCount = pi.getAllTools().length;
-			watchForAsyncTools({
+			stopAsyncToolWatch = watchForAsyncTools({
 				getToolCount: () => pi.getAllTools().length,
-				onStabilized: async () => {
-					const newCount = pi.getAllTools().length;
-					if (newCount === watchInitialCount) return; // no change
-
-					// Merge new tools into existing groups via prefix detection.
-					// Existing group assignments are preserved; only unassigned tools
-					// get categorized and added.
-					const allTools = pi.getAllTools();
-					const known = new Set(toolGroups.flatMap(g => g.tools));
-					const newTools = allTools.filter(t => !known.has(t.name));
-					if (newTools.length > 0) {
-						const newGroups = categorizeTools(newTools);
-						for (const ng of newGroups) {
-							const existing = toolGroups.find(g => g.name === ng.name);
-							if (existing) {
-								// Merge tools into existing group
-								existing.tools.push(...ng.tools);
-							} else {
-								// New group — add with on-demand default
-								toolGroups.push(ng);
-								if (config) config.groups[ng.name] = "on-demand";
-							}
-						}
-						rebuildIndex();
+				onSettled: async () => {
+					const stableHash = computeToolHash(pi.getAllTools());
+					if (config!.toolHash !== stableHash) {
+						const recategorized = await runLlmCategorization(ctx, () => generation === sessionGeneration);
+						if (!recategorized) return;
+						if (ctx.hasUI) await runSetupWizard(ctx);
 					}
+
+					const result = mergeLateToolsIntoConfig(config!, toolGroups, pi.getAllTools());
+					config = result.config;
+					toolGroups = result.toolGroups;
+					saveConfigToPath(getConfigPath(), config);
+					rebuildIndex();
 					applyActiveTools();
 					updateStatus(ctx);
 				},
 			});
 		}
+	});
+
+	pi.on("session_shutdown", () => {
+		sessionGeneration++;
+		stopAsyncToolWatch?.();
+		stopAsyncToolWatch = undefined;
 	});
 
 	// Restore on tree navigation

@@ -1,6 +1,11 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
+
+const lazyToolsExtensionSource = readFileSync(
+	new URL("../extensions/lazy-tools.ts", import.meta.url),
+	"utf8",
+);
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -21,6 +26,8 @@ import {
 	buildCategorizationPrompt,
 	parseCategorizationResponse,
 	mergeGroupsIntoConfig,
+	mergeLateToolsIntoConfig,
+	withDebugLogging,
 	autoSelectCategorizationModel,
 	GroupIndex,
 	shouldPassthrough,
@@ -33,6 +40,36 @@ import {
 	type GroupMode,
 	type ModelLike,
 } from "../lib/lib.js";
+
+describe("categorization runtime", () => {
+	it("uses Pi's scoped model registry without the compatibility API", () => {
+		assert.doesNotMatch(lazyToolsExtensionSource, /@earendil-works\/pi-ai\/compat/);
+		assert.match(lazyToolsExtensionSource, /ctx\.modelRegistry\.complete\(/);
+	});
+
+	it("waits for tool registration to settle before persisting cached groups", () => {
+		assert.match(lazyToolsExtensionSource, /onSettled:\s*async\s*\(\)\s*=>/);
+		assert.match(lazyToolsExtensionSource, /const stableHash = computeToolHash\(pi\.getAllTools\(\)\)/);
+		assert.match(lazyToolsExtensionSource, /if \(config!\.toolHash !== stableHash\)/);
+		assert.match(lazyToolsExtensionSource, /const recategorized = await runLlmCategorization\(ctx, \(\) => generation === sessionGeneration\)/);
+		assert.doesNotMatch(lazyToolsExtensionSource, /else if \(config\.toolHash !== currentHash\)/);
+	});
+
+	it("applies cached groups while the settled registry recategorizes", () => {
+		assert.match(lazyToolsExtensionSource, /else if \(config\.toolGroups\) \{[\s\S]*?toolGroups = config\.toolGroups;\s*rebuildIndex\(\);/);
+	});
+
+	it("restores debug logging before session startup diagnostics", () => {
+		assert.match(lazyToolsExtensionSource, /debugLogging = config\?\.debugLogging === true/);
+		assert.match(lazyToolsExtensionSource, /withDebugLogging\(config, debugLogging\)/);
+	});
+
+	it("cancels and ignores async work after session replacement", () => {
+		assert.match(lazyToolsExtensionSource, /pi\.on\("session_shutdown"/);
+		assert.match(lazyToolsExtensionSource, /stopAsyncToolWatch\?\.\(\)/);
+		assert.match(lazyToolsExtensionSource, /runLlmCategorization\(ctx, \(\) => generation === sessionGeneration\)/);
+	});
+});
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -453,6 +490,17 @@ describe("config persistence", () => {
 	});
 });
 
+describe("withDebugLogging", () => {
+	it("persists debug logging without mutating the current config", () => {
+		const config = buildDefaultConfig(categorizeTools(MOCK_TOOLS));
+
+		const result = withDebugLogging(config, true);
+
+		assert.equal(result.debugLogging, true);
+		assert.equal(config.debugLogging, undefined);
+	});
+});
+
 // ─── buildDefaultConfig ─────────────────────────────────────────────────────
 
 describe("buildDefaultConfig", () => {
@@ -488,6 +536,39 @@ function sleep(ms: number): Promise<void> {
 }
 
 describe("watchForAsyncTools", () => {
+	it("calls onSettled when the initial tool count stabilizes", async () => {
+		let settledCalled = false;
+
+		watchForAsyncTools({
+			getToolCount: () => 10,
+			onStabilized: () => {},
+			onSettled: () => { settledCalled = true; },
+			pollIntervalMs: 50,
+			stableThreshold: 2,
+			maxWaitMs: 500,
+		});
+
+		await sleep(200);
+		assert.equal(settledCalled, true);
+	});
+
+	it("calls onSettled without onStabilized when the tool count changes", async () => {
+		let count = 10;
+		let settledCalled = false;
+
+		watchForAsyncTools({
+			getToolCount: () => count,
+			onSettled: () => { settledCalled = true; },
+			pollIntervalMs: 50,
+			stableThreshold: 2,
+			maxWaitMs: 500,
+		});
+		setTimeout(() => { count = 11; }, 60);
+
+		await sleep(250);
+		assert.equal(settledCalled, true);
+	});
+
 	it("calls onStabilized when tool count changes and stabilizes", async () => {
 		let toolCount = 10;
 		let stabilizedCalled = false;
@@ -663,6 +744,25 @@ describe("reconcileConfig", () => {
 		const { config: result, prunedGroups } = reconcileConfig(config, groups);
 		assert.equal(prunedGroups.length, 0);
 		assert.strictEqual(result, config, "should return same config reference when no changes");
+	});
+});
+
+describe("mergeLateToolsIntoConfig", () => {
+	it("persists groups and the hash for the stabilized tool set", () => {
+		const initialTools: ToolLike[] = [
+			{ name: "read" },
+			{ name: "vault_search" },
+			{ name: "vault_get_user" },
+		];
+		const finalTools = [...initialTools, { name: "grokt_search" }, { name: "grokt_get_file" }];
+		const initialGroups = categorizeTools(initialTools);
+		const config = buildDefaultConfig(initialGroups, { toolHash: computeToolHash(initialTools) });
+
+		const result = mergeLateToolsIntoConfig(config, initialGroups, finalTools);
+
+		assert.equal(result.config.toolHash, computeToolHash(finalTools));
+		assert.deepEqual(result.toolGroups.find(group => group.name === "grokt")?.tools, ["grokt_search", "grokt_get_file"]);
+		assert.equal(config.toolGroups?.some(group => group.name === "grokt"), false);
 	});
 });
 
