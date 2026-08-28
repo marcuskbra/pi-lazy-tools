@@ -42,6 +42,7 @@ import {
 	buildCategorizationPrompt,
 	parseCategorizationResponse,
 	mergeGroupsIntoConfig,
+	mergeLateToolsIntoConfig,
 	autoSelectCategorizationModel,
 	shouldPassthrough,
 	shouldBackgroundCategorize,
@@ -779,7 +780,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 				// ── Cache hit: tools unchanged, use stored groups ──
 				toolGroups = config.toolGroups;
 				rebuildIndex();
-			} else if (config.toolHash !== currentHash) {
+			} else if (!config.toolGroups) {
 				// ── Tools changed: re-categorize ──
 				const previousGroupNames = new Set(Object.keys(config.groups));
 				const defer = shouldBackgroundCategorize(config.backgroundCategorization);
@@ -853,39 +854,17 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		if (config) applyActiveTools();
 		updateStatus(ctx);
 
-		// Watch for async tool registrations (e.g. vault MCP discovery).
-		// When new tools appear, merge them into existing groups via prefix detection.
-		// Does NOT re-run LLM or update the config hash — that only happens
-		// during first-time setup or explicit /tools-setup.
+		// Wait for async tool registrations (e.g. vault MCP discovery) before
+		// merging late tools and persisting the complete registry hash.
 		if (config) {
-			const watchInitialCount = pi.getAllTools().length;
 			watchForAsyncTools({
 				getToolCount: () => pi.getAllTools().length,
-				onStabilized: async () => {
-					const newCount = pi.getAllTools().length;
-					if (newCount === watchInitialCount) return; // no change
-
-					// Merge new tools into existing groups via prefix detection.
-					// Existing group assignments are preserved; only unassigned tools
-					// get categorized and added.
-					const allTools = pi.getAllTools();
-					const known = new Set(toolGroups.flatMap(g => g.tools));
-					const newTools = allTools.filter(t => !known.has(t.name));
-					if (newTools.length > 0) {
-						const newGroups = categorizeTools(newTools);
-						for (const ng of newGroups) {
-							const existing = toolGroups.find(g => g.name === ng.name);
-							if (existing) {
-								// Merge tools into existing group
-								existing.tools.push(...ng.tools);
-							} else {
-								// New group — add with on-demand default
-								toolGroups.push(ng);
-								if (config) config.groups[ng.name] = "on-demand";
-							}
-						}
-						rebuildIndex();
-					}
+				onSettled: async () => {
+					const result = mergeLateToolsIntoConfig(config!, toolGroups, pi.getAllTools());
+					config = result.config;
+					toolGroups = result.toolGroups;
+					saveConfigToPath(getConfigPath(), config);
+					rebuildIndex();
 					applyActiveTools();
 					updateStatus(ctx);
 				},
