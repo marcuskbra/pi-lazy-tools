@@ -22,7 +22,6 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { DynamicBorder, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Key, type SelectItem, SelectList, type SettingItem, SettingsList, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { completeSimple } from "@earendil-works/pi-ai";
 import {
 	type GroupMode,
 	type LazyToolsConfig,
@@ -149,9 +148,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		debugLog(`categorizationWithModel: model=${model?.provider}/${model?.id} toolCount=${allTools.length} toolNames=${allToolNames.join(",")}`);
 
 		try {
-			const { apiKey, headers } = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-			debugLog(`categorizationWithModel: got apiKey=${apiKey ? "yes(" + apiKey.slice(0,8) + "...)" : "NONE"} headers=${JSON.stringify(headers ?? {})}`);
-			const response = await completeSimple(
+			const response = await ctx.modelRegistry.complete(
 				model,
 				{
 					systemPrompt: prompt,
@@ -161,7 +158,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 						timestamp: Date.now(),
 					}],
 				},
-				{ maxTokens: 8192, apiKey, headers, samplingParams: thinkingOffParams(model) },
+				{ maxTokens: 8192, samplingParams: thinkingOffParams(model) },
 			);
 
 			const text = response.content
@@ -275,8 +272,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		].join("\n");
 
 		try {
-			const { apiKey, headers } = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-			const response = await completeSimple(
+			const response = await ctx.modelRegistry.complete(
 				model,
 				{
 					systemPrompt: "You are a tool group selector. Return only a JSON array.",
@@ -286,7 +282,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 						timestamp: Date.now(),
 					}],
 				},
-				{ maxTokens: 256, apiKey, headers, samplingParams: thinkingOffParams(model) },
+				{ maxTokens: 256, samplingParams: thinkingOffParams(model) },
 			);
 			const text = response.content
 				.filter((c: any) => c.type === "text")

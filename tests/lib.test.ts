@@ -1,6 +1,11 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
+
+const lazyToolsExtensionSource = readFileSync(
+	new URL("../extensions/lazy-tools.ts", import.meta.url),
+	"utf8",
+);
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -33,6 +38,13 @@ import {
 	type GroupMode,
 	type ModelLike,
 } from "../lib/lib.js";
+
+describe("categorization runtime", () => {
+	it("uses Pi's scoped model registry without the compatibility API", () => {
+		assert.doesNotMatch(lazyToolsExtensionSource, /@earendil-works\/pi-ai\/compat/);
+		assert.match(lazyToolsExtensionSource, /ctx\.modelRegistry\.complete\(/);
+	});
+});
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
