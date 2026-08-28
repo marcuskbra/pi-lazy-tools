@@ -55,6 +55,10 @@ describe("categorization runtime", () => {
 		assert.doesNotMatch(lazyToolsExtensionSource, /else if \(config\.toolHash !== currentHash\)/);
 	});
 
+	it("applies cached groups while the settled registry recategorizes", () => {
+		assert.match(lazyToolsExtensionSource, /else if \(config\.toolGroups\) \{[\s\S]*?toolGroups = config\.toolGroups;\s*rebuildIndex\(\);/);
+	});
+
 	it("restores debug logging before session startup diagnostics", () => {
 		assert.match(lazyToolsExtensionSource, /debugLogging = config\?\.debugLogging === true/);
 		assert.match(lazyToolsExtensionSource, /withDebugLogging\(config, debugLogging\)/);

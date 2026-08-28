@@ -791,7 +791,12 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 				// ── Cache hit: tools unchanged, use stored groups ──
 				toolGroups = config.toolGroups;
 				rebuildIndex();
-			} else if (!config.toolGroups) {
+			} else if (config.toolGroups) {
+				// The settled watcher will recategorize, but the session can use the
+				// previous grouping while that LLM request runs.
+				toolGroups = config.toolGroups;
+				rebuildIndex();
+			} else {
 				// ── Tools changed: re-categorize ──
 				const previousGroupNames = new Set(Object.keys(config.groups));
 				const defer = shouldBackgroundCategorize(config.backgroundCategorization);
