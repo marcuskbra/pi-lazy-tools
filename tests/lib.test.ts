@@ -33,6 +33,7 @@ import {
 	shouldPassthrough,
 	shouldBackgroundCategorize,
 	runCategorizationMaybeDeferred,
+	migrateConfigToProfiles,
 	inheritModeBySignature,
 	type ToolLike,
 	type ToolGroup,
@@ -690,6 +691,33 @@ describe("watchForAsyncTools", () => {
 		toolCount = 38;
 		await sleep(400);
 		assert.equal(callCount, 1, "should fire exactly once");
+	});
+});
+
+// ─── Profile Config Migration ─────────────────────────────────────────────────
+
+describe("profile config migration", () => {
+	it("moves a legacy cache into a hash-keyed profile without losing its active projection", () => {
+		const legacy: LazyToolsConfig = {
+			version: 1,
+			groups: { core: "always", vault: "on-demand" },
+			toolHash: "tools-a",
+			toolGroups: [
+				{ name: "core", displayName: "Core", description: "Core tools", tools: ["read"] },
+				{ name: "vault", displayName: "Vault", description: "Vault tools", tools: ["vault_search"] },
+			],
+		};
+
+		const result = migrateConfigToProfiles(legacy);
+
+		assert.equal(result.migrated, true);
+		assert.equal(result.config.version, 2);
+		assert.deepEqual(result.config.profiles?.["tools-a"], {
+			groups: legacy.groups,
+			toolGroups: legacy.toolGroups,
+		});
+		assert.deepEqual(result.config.groups, legacy.groups);
+		assert.deepEqual(result.config.toolGroups, legacy.toolGroups);
 	});
 });
 

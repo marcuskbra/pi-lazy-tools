@@ -23,8 +23,13 @@ export interface ToolGroup {
 
 export type GroupMode = "always" | "on-demand" | "off";
 
+export interface ToolProfile {
+	groups: Record<string, GroupMode>;
+	toolGroups: ToolGroup[];
+}
+
 export interface LazyToolsConfig {
-	version: 1;
+	version: 1 | 2;
 	groups: Record<string, GroupMode>;
 	/** Model used for LLM categorization (e.g. "google/gemini-2.0-flash") */
 	categorizationModel?: string;
@@ -32,6 +37,8 @@ export interface LazyToolsConfig {
 	toolHash?: string;
 	/** LLM-generated group definitions (cached) */
 	toolGroups?: ToolGroup[];
+	/** Cached groups and modes for each stable tool inventory. */
+	profiles?: Record<string, ToolProfile>;
 	/**
 	 * Preserve user group modes across LLM re-categorization renames by matching
 	 * new groups to old ones by tool-set signature instead of by group name.
@@ -79,6 +86,25 @@ export interface CategorizationConfig {
 	maxGroups?: number;
 	/** Override for the grouping-guidance bullet lines. */
 	guidance?: string;
+}
+
+export function migrateConfigToProfiles(
+	config: LazyToolsConfig,
+): { config: LazyToolsConfig; migrated: boolean } {
+	if (config.profiles) return { config, migrated: false };
+
+	const profiles: Record<string, ToolProfile> = {};
+	if (config.toolHash && config.toolGroups) {
+		profiles[config.toolHash] = {
+			groups: { ...config.groups },
+			toolGroups: config.toolGroups.map((group) => ({ ...group, tools: [...group.tools] })),
+		};
+	}
+
+	return {
+		config: { ...config, version: 2, profiles },
+		migrated: true,
+	};
 }
 
 // ─── Prompt-based Group Detection ────────────────────────────────────────────
