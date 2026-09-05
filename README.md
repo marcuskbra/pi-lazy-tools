@@ -26,7 +26,7 @@ This is a fork of `ashwin-shopify/pi-lazy-tools` that adds durable group modes, 
 
 ### First Run
 
-On first session start, the extension prompts you to configure tool groups. Or accept the default (core always-on, everything else on-demand).
+On first session start, the extension waits for tool registration to settle, then prompts you to configure tool groups. Later starts restore the saved profile for the current tool inventory without reopening setup. Or accept the default (core always-on, everything else on-demand).
 
 <img width="465" height="430" alt="image" src="https://github.com/user-attachments/assets/14e444a0-7c09-49e7-b658-e19d0160e257" />
 
@@ -86,7 +86,7 @@ Saved to `~/.pi/agent/lazy-tools.json`:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "groups": {
     "core": "always",
     "memory": "always",
@@ -94,6 +94,13 @@ Saved to `~/.pi/agent/lazy-tools.json`:
     "vault": "on-demand",
     "slack": "on-demand",
     "buildkite": "off"
+  },
+  "toolHash": "b230f89df7c1d491",
+  "profiles": {
+    "b230f89df7c1d491": {
+      "groups": { "core": "always", "observe": "on-demand" },
+      "toolGroups": "machine-generated cached group definitions"
+    }
   },
   "preserveModesBySignature": true,
   "passthrough": {
@@ -109,30 +116,32 @@ Saved to `~/.pi/agent/lazy-tools.json`:
 
 ## Durability and spawned agents
 
-Five opt-in settings live in the same `lazy-tools.json`. They default off, so
-behaviour is unchanged until you enable them. The config file is not touched by
-package updates, and a spawned teammate reads the same file, so enabling a
-setting once carries across updates and into every child pi process.
+The config stores global settings and hash-keyed tool profiles. Each profile
+owns the grouping and modes for one stable tool inventory. A return to a known
+inventory restores its exact profile without a categorization call or setup
+modal. The legacy top-level group fields mirror the active profile so earlier
+package versions can still read the last-used configuration.
 
 ### preserveModesBySignature
 
-Group modes are stored under the LLM's group name. When the installed tool set
-changes, the extension re-runs the categorization LLM, which may rename a
-cluster (for example `team_management` becomes `team`). A rename used to drop
-your `always` choice back to `on-demand`. With `preserveModesBySignature: true`,
-a re-categorized group inherits the mode of the old group its tools most came
-from, so `always` survives renames.
+When an unseen tool inventory needs a new profile, the extension categorizes it
+once and may rename a cluster (for example `team_management` becomes `team`). A
+rename used to drop your `always` choice back to `on-demand`. With
+`preserveModesBySignature: true`, the new profile inherits the mode of the old
+group its tools most came from, so `always` survives renames.
 
 ### passthrough
 
 pi has no native notion of a subagent. A team teammate is just a child pi
 process reading this same config, and this extension's tool filtering would
 strip the `team_message` and `team_shutdown` tools the teammate needs to report
-back and shut down. With `passthrough.enabled: true`, the extension stops
-filtering when either the run mode is in `modes` (a pi-native signal covering
-RPC and one-shot runs) or one of `envMarkers` is present in the environment
-(covering pane-spawned teammates, which run as ordinary `tui` sessions and are
-only identifiable by the role marker their spawner injects). Add other spawner
+back and shut down. Before the first config exists, known spawned and
+non-interactive sessions pass through so an unattended process cannot open the
+setup modal. With `passthrough.enabled: true`, later sessions stop filtering
+when either the run mode is in `modes` (a pi-native signal covering RPC and
+one-shot runs) or one of `envMarkers` is present in the environment (covering
+pane-spawned teammates, which run as ordinary `tui` sessions and are only
+identifiable by the role marker their spawner injects). Add other spawner
 markers, such as a future `PI_SUBAGENT`, to `envMarkers` without a code change.
 
 ### categorization
@@ -149,15 +158,11 @@ and persists this setting. Set it to `false` after diagnosis.
 
 ### backgroundCategorization
 
-When the installed tool set changes, the extension re-runs the categorization
-LLM. That call is normally awaited inside `session_start`, so startup blocks for
-the full model latency (seconds) before the session is usable. With
-`backgroundCategorization.enabled: true`, the extension applies the previously
-cached groups at once (prefix-detecting any new tools), lets the session start,
-and runs the LLM pass in the background, swapping in the fresh groups when it
-finishes. The tradeoff: the first prompt right after a tool-set change may
-briefly see the previous grouping until the background pass lands. Default off,
-so the blocking behaviour is unchanged until you enable it.
+When the settled tool inventory has no saved profile, the extension applies a
+cached or prefix-based grouping, then creates one profile in the background.
+Known inventories restore immediately. Background categorization never opens
+setup after the first install. The first prompt after an unseen inventory may
+briefly use the fallback grouping until categorization finishes.
 
 The `bench/background-categorization.mts` script shows the effect with the LLM
 stubbed to a fixed latency: the awaited startup time drops from the full latency

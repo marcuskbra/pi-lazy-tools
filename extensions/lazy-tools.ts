@@ -36,18 +36,18 @@ import {
 	buildDefaultConfig,
 	buildLazyGroupsPrompt,
 	watchForAsyncTools,
-	reconcileConfig,
+	migrateConfigToProfiles,
+	activateToolProfile,
+	saveToolProfile,
+	getInitialToolGroups,
 	GroupIndex,
 	computeToolHash,
 	buildCategorizationPrompt,
 	parseCategorizationResponse,
 	mergeGroupsIntoConfig,
-	mergeLateToolsIntoConfig,
 	withDebugLogging,
 	autoSelectCategorizationModel,
-	shouldPassthrough,
-	shouldBackgroundCategorize,
-	runCategorizationMaybeDeferred,
+	shouldUseInitialPassthrough,
 } from "../lib/lib.js";
 
 function getConfigPath(): string {
@@ -100,6 +100,29 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 
 	function loadableGroups(): ToolGroup[] {
 		return getLoadableGroups(toolGroups, config, sessionActivated);
+	}
+
+	async function waitForToolInventory(generation: number): Promise<boolean> {
+		return new Promise((resolve) => {
+			let settled = false;
+			let stop = () => {};
+			const finish = (isCurrent: boolean) => {
+				if (settled) return;
+				settled = true;
+				resolve(isCurrent);
+			};
+
+			stop = watchForAsyncTools({
+				getToolCount: () => pi.getAllTools().length,
+				onSettled: () => finish(generation === sessionGeneration),
+			});
+			const cancel = () => {
+				stop();
+				finish(false);
+			};
+			if (settled) stop();
+			else stopAsyncToolWatch = cancel;
+		});
 	}
 
 	function updateStatus(ctx: ExtensionContext): void {
@@ -391,7 +414,11 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 
 	// ── Setup Wizard ──────────────────────────────────────────────────────
 
-	async function runSetupWizard(ctx: ExtensionContext, opts?: { firstTime?: boolean; showModePicker?: boolean }): Promise<boolean> {
+	async function runSetupWizard(
+		ctx: ExtensionContext,
+		opts?: { firstTime?: boolean; showModePicker?: boolean },
+		isCurrent = () => true,
+	): Promise<boolean> {
 		// ── First-time: auto-select model → LLM categorization → prefix fallback ──
 		if (opts?.firstTime) {
 			const allTools = pi.getAllTools();
@@ -410,6 +437,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 				if (model) {
 					ctx.ui.setStatus("lazy-tools", `⚡ Categorizing ${toolCount} tools with ${selectedModel}...`);
 					const parsed = await categorizationWithModel(model, ctx);
+					if (!isCurrent()) return false;
 					if (parsed) {
 						toolGroups = parsed;
 						rebuildIndex();
@@ -422,6 +450,7 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 			}
 
 			// Fallback: prefix-based categorization (no LLM needed)
+			if (!isCurrent()) return false;
 			if (!usedLlm) {
 				toolGroups = categorizeTools(allTools);
 				rebuildIndex();
@@ -440,31 +469,37 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		// ── Mode picker (skip if no UI or explicitly disabled) ──
 		if (opts?.showModePicker === false) return true;
 
+		// The watcher may activate another profile while this modal is open.
+		// Save the choices under the profile that this modal displayed.
+		const wizardConfig = config;
+		const wizardToolHash = wizardConfig?.toolHash ?? computeToolHash(pi.getAllTools());
+		const wizardToolGroups = toolGroups.map((group) => ({ ...group, tools: [...group.tools] }));
+
 		// Enter/Space cycles mode. SettingsList handles everything natively.
 		// Pad every label to a uniform width so the mode column lines up. pi-tui's
 		// SettingsList caps its own label padding at 30 columns, so a label longer
 		// than that would get no padding and push its value out of alignment; giving
 		// every label the same width makes that cap a no-op and keeps the columns
 		// aligned regardless of the longest group name.
-		const rawLabels = toolGroups.map((group) => `${group.displayName} (${group.tools.length} tools)`);
+		const rawLabels = wizardToolGroups.map((group) => `${group.displayName} (${group.tools.length} tools)`);
 		const labelWidth = Math.max(0, ...rawLabels.map((l) => visibleWidth(l)));
-		const items: SettingItem[] = toolGroups.map((group, i) => {
+		const items: SettingItem[] = wizardToolGroups.map((group, i) => {
 			const isCore = group.name === "core";
 			const label = rawLabels[i] + " ".repeat(Math.max(0, labelWidth - visibleWidth(rawLabels[i])));
 			return {
 				id: group.name,
 				label,
 				description: group.tools.join(", "),
-				currentValue: isCore ? "always" : (config?.groups[group.name] ?? "on-demand"),
+				currentValue: isCore ? "always" : (wizardConfig?.groups[group.name] ?? "on-demand"),
 				values: isCore ? ["always"] : ["always", "on-demand", "off"],
 			};
 		});
 
 		const newConfig: Record<string, GroupMode> = {};
 
-		// Initialize from current config
-		for (const group of toolGroups) {
-			newConfig[group.name] = getGroupMode(config, group.name);
+		// Initialize from the profile shown in this modal.
+		for (const group of wizardToolGroups) {
+			newConfig[group.name] = getGroupMode(wizardConfig, group.name);
 		}
 
 		const result = await ctx.ui.custom<boolean>((_tui, theme, _kb, done) => {
@@ -494,11 +529,12 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 					newConfig[id] = newValue as GroupMode;
 				},
 				() => {
-					config = {
-						...config,
-						version: 1,
-						groups: newConfig,
-					};
+					if (!isCurrent()) {
+						done(false);
+						return;
+					}
+					const activate = config?.toolHash === wizardToolHash;
+					config = saveToolProfile(config!, wizardToolHash, newConfig, wizardToolGroups, { activate });
 					saveConfigToPath(getConfigPath(), config);
 					done(true);
 				},
@@ -596,7 +632,9 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 				toolGroups = categorizeTools(pi.getAllTools());
 				rebuildIndex();
 			}
-			await runSetupWizard(ctx);
+			const generation = sessionGeneration;
+			await runSetupWizard(ctx, undefined, () => generation === sessionGeneration);
+			if (generation !== sessionGeneration) return;
 			sessionActivated.clear();
 			applyActiveTools();
 			updateStatus(ctx);
@@ -762,11 +800,17 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		// child pi process reading this same config file; filtering its tools
 		// here strips the team_message/team_shutdown tools it needs to report
 		// back and shut down. Opt-in via config; off by default.
-		if (shouldPassthrough(config?.passthrough, ctx.mode, process.env)) {
+		if (shouldUseInitialPassthrough(config, ctx.mode, process.env)) {
 			isEnabled = false;
 			ctx.ui.setStatus("lazy-tools", undefined);
 			debugLog(`session_start: passthrough active (mode=${ctx.mode}) — lazy filtering disabled, all tools remain active`);
 			return;
+		}
+
+		if (config) {
+			const migration = migrateConfigToProfiles(config);
+			config = migration.config;
+			if (migration.migrated) saveConfigToPath(getConfigPath(), config);
 		}
 
 		// Restore session-activated groups from branch
@@ -781,112 +825,52 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 		}
 
 		if (!config && event.reason === "startup") {
-			// ── First time: auto-categorize (no UI needed), then optionally show mode picker ──
-			await runSetupWizard(ctx, { firstTime: true, showModePicker: ctx.hasUI });
+			const inventorySettled = await waitForToolInventory(generation);
+			if (!inventorySettled) return;
+
+			await runSetupWizard(
+				ctx,
+				{ firstTime: true, showModePicker: ctx.hasUI },
+				() => generation === sessionGeneration,
+			);
+			if (generation !== sessionGeneration) return;
 			debugLog(`session_start: after firstTime setup, config=${config ? "set" : "null"} groups=${toolGroups.length}`);
 		} else if (config) {
-			const currentHash = computeToolHash(pi.getAllTools());
-
-			if (config.toolGroups && config.toolHash === currentHash) {
-				// ── Cache hit: tools unchanged, use stored groups ──
-				toolGroups = config.toolGroups;
-				rebuildIndex();
-			} else if (config.toolGroups) {
-				// The settled watcher will recategorize, but the session can use the
-				// previous grouping while that LLM request runs.
-				toolGroups = config.toolGroups;
-				rebuildIndex();
-			} else {
-				// ── Tools changed: re-categorize ──
-				const previousGroupNames = new Set(Object.keys(config.groups));
-				const defer = shouldBackgroundCategorize(config.backgroundCategorization);
-
-				// Apply the previous groups now, prefix-detecting any new tools.
-				// This is the immediate, cheap grouping used both as the deferred
-				// startup grouping and as the blocking-path fallback when the LLM
-				// pass fails. Behaviour is identical to the prior inline fallback.
-				const applyCachedGroups = () => {
-					if (config!.toolGroups) {
-						toolGroups = config!.toolGroups;
-						rebuildIndex();
-						const allTools = pi.getAllTools();
-						const known = new Set(toolGroups.flatMap(g => g.tools));
-						const newTools = allTools.filter(t => !known.has(t.name));
-						if (newTools.length > 0) {
-							const newGroups = categorizeTools(newTools);
-							for (const ng of newGroups) {
-								const existing = toolGroups.find(g => g.name === ng.name);
-								if (existing) {
-									existing.tools.push(...ng.tools);
-								} else {
-									toolGroups.push(ng);
-									config!.groups[ng.name] = "on-demand";
-								}
-							}
-							rebuildIndex();
-						}
-					} else {
-						// No saved groups at all — prefix-detect everything
-						toolGroups = categorizeTools(pi.getAllTools());
-						rebuildIndex();
-					}
-				};
-
-				const runCategorization = async () => {
-					const reran = await runLlmCategorization(ctx);
-					if (reran) {
-						// mergeGroupsIntoConfig preserves existing mode preferences.
-						// Only show wizard if there are genuinely NEW groups the user
-						// hasn't configured yet. Skip the interactive wizard when
-						// deferred: a background pass must not seize the UI after the
-						// session has already started; the status line signals the swap.
-						const newGroupNames = Object.keys(config!.groups);
-						const hasNewGroups = newGroupNames.some(g => !previousGroupNames.has(g));
-						if (hasNewGroups && ctx.hasUI && !defer) {
-							await runSetupWizard(ctx);
-						}
-						saveConfigToPath(getConfigPath(), config!);
-					} else if (!defer) {
-						// Blocking path, LLM failed: fall back to previous groups +
-						// prefix detection and tell the user.
-						applyCachedGroups();
-						ctx.ui.notify("lazy-tools: tool set changed, using previous groups. Run /tools-setup to reconfigure.", "info");
-					}
-					// Deferred: cached groups were applied up front and the session
-					// already started, so swap in whatever the pass produced.
-					if (defer) {
-						applyActiveTools();
-						updateStatus(ctx);
-					}
-				};
-
-				await runCategorizationMaybeDeferred(defer, {
-					applyCachedGroups,
-					runCategorization,
-				});
-			}
+			toolGroups = getInitialToolGroups(config, pi.getAllTools());
+			rebuildIndex();
 		}
 
 		if (config) applyActiveTools();
 		updateStatus(ctx);
 
-		// Wait for async tool registrations (e.g. vault MCP discovery) before
-		// merging late tools and persisting the complete registry hash.
+		// Wait for async tool registrations before restoring an exact profile or
+		// categorizing a newly observed inventory. Only the first install opens setup.
 		if (config) {
 			stopAsyncToolWatch = watchForAsyncTools({
 				getToolCount: () => pi.getAllTools().length,
 				onSettled: async () => {
-					const stableHash = computeToolHash(pi.getAllTools());
-					if (config!.toolHash !== stableHash) {
-						const recategorized = await runLlmCategorization(ctx, () => generation === sessionGeneration);
-						if (!recategorized) return;
-						if (ctx.hasUI) await runSetupWizard(ctx);
+					if (generation !== sessionGeneration) return;
+
+					const allTools = pi.getAllTools();
+					const stableHash = computeToolHash(allTools);
+					const profile = activateToolProfile(config!, stableHash);
+					if (profile) {
+						config = profile;
+						toolGroups = profile.toolGroups ?? [];
+						saveConfigToPath(getConfigPath(), config);
+					} else {
+						const recategorized = await runLlmCategorization(
+							ctx,
+							() => generation === sessionGeneration,
+						);
+						if (generation !== sessionGeneration) return;
+						if (!recategorized) {
+							toolGroups = categorizeTools(allTools);
+							config = mergeGroupsIntoConfig(config!, toolGroups, stableHash);
+							saveConfigToPath(getConfigPath(), config);
+						}
 					}
 
-					const result = mergeLateToolsIntoConfig(config!, toolGroups, pi.getAllTools());
-					config = result.config;
-					toolGroups = result.toolGroups;
-					saveConfigToPath(getConfigPath(), config);
 					rebuildIndex();
 					applyActiveTools();
 					updateStatus(ctx);

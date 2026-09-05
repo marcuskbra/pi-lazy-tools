@@ -31,9 +31,13 @@ import {
 	autoSelectCategorizationModel,
 	GroupIndex,
 	shouldPassthrough,
+	shouldUseInitialPassthrough,
 	shouldBackgroundCategorize,
 	runCategorizationMaybeDeferred,
 	migrateConfigToProfiles,
+	saveToolProfile,
+	activateToolProfile,
+	getInitialToolGroups,
 	inheritModeBySignature,
 	type ToolLike,
 	type ToolGroup,
@@ -48,16 +52,22 @@ describe("categorization runtime", () => {
 		assert.match(lazyToolsExtensionSource, /ctx\.modelRegistry\.complete\(/);
 	});
 
-	it("waits for tool registration to settle before persisting cached groups", () => {
+	it("waits for tool registration to settle before selecting an inventory profile", () => {
 		assert.match(lazyToolsExtensionSource, /onSettled:\s*async\s*\(\)\s*=>/);
-		assert.match(lazyToolsExtensionSource, /const stableHash = computeToolHash\(pi\.getAllTools\(\)\)/);
-		assert.match(lazyToolsExtensionSource, /if \(config!\.toolHash !== stableHash\)/);
-		assert.match(lazyToolsExtensionSource, /const recategorized = await runLlmCategorization\(ctx, \(\) => generation === sessionGeneration\)/);
-		assert.doesNotMatch(lazyToolsExtensionSource, /else if \(config\.toolHash !== currentHash\)/);
+		assert.match(lazyToolsExtensionSource, /const stableHash = computeToolHash\(allTools\)/);
+		assert.match(lazyToolsExtensionSource, /const profile = activateToolProfile\(config!, stableHash\)/);
+		assert.match(lazyToolsExtensionSource, /runLlmCategorization\(\s*ctx,\s*\(\) => generation === sessionGeneration,\s*\)/);
+		assert.doesNotMatch(lazyToolsExtensionSource, /if \(ctx\.hasUI\) await runSetupWizard\(ctx\);/);
 	});
 
-	it("applies cached groups while the settled registry recategorizes", () => {
-		assert.match(lazyToolsExtensionSource, /else if \(config\.toolGroups\) \{[\s\S]*?toolGroups = config\.toolGroups;\s*rebuildIndex\(\);/);
+	it("keeps cached groups until the settled inventory profile is known", () => {
+		assert.match(lazyToolsExtensionSource, /toolGroups = getInitialToolGroups\(config, pi\.getAllTools\(\)\)/);
+		assert.doesNotMatch(lazyToolsExtensionSource, /activateToolProfile\(config, computeToolHash\(pi\.getAllTools\(\)\)\)/);
+	});
+
+	it("waits for a stable inventory before opening first-run setup", () => {
+		assert.match(lazyToolsExtensionSource, /const inventorySettled = await waitForToolInventory\(generation\);\s*if \(!inventorySettled\) return;/);
+		assert.match(lazyToolsExtensionSource, /await runSetupWizard\(\s*ctx,\s*\{ firstTime: true, showModePicker: ctx\.hasUI \},\s*\(\) => generation === sessionGeneration,/);
 	});
 
 	it("restores debug logging before session startup diagnostics", () => {
@@ -65,10 +75,21 @@ describe("categorization runtime", () => {
 		assert.match(lazyToolsExtensionSource, /withDebugLogging\(config, debugLogging\)/);
 	});
 
+	it("saves the active profile projection after profile restoration", () => {
+		assert.match(lazyToolsExtensionSource, /toolGroups = profile\.toolGroups \?\? \[\];\s*saveConfigToPath\(getConfigPath\(\), config\);/);
+	});
+
+	it("guards first-run categorization and snapshots wizard profile data", () => {
+		assert.match(lazyToolsExtensionSource, /if \(!isCurrent\(\)\) return false;\s*if \(parsed\)/);
+		assert.match(lazyToolsExtensionSource, /const wizardToolHash = wizardConfig\?\.toolHash \?\? computeToolHash\(pi\.getAllTools\(\)\);/);
+		assert.match(lazyToolsExtensionSource, /saveToolProfile\(config!, wizardToolHash, newConfig, wizardToolGroups, \{ activate \}\)/);
+	});
+
 	it("cancels and ignores async work after session replacement", () => {
 		assert.match(lazyToolsExtensionSource, /pi\.on\("session_shutdown"/);
 		assert.match(lazyToolsExtensionSource, /stopAsyncToolWatch\?\.\(\)/);
-		assert.match(lazyToolsExtensionSource, /runLlmCategorization\(ctx, \(\) => generation === sessionGeneration\)/);
+		assert.match(lazyToolsExtensionSource, /if \(generation !== sessionGeneration\) return;/);
+		assert.match(lazyToolsExtensionSource, /runLlmCategorization\(\s*ctx,\s*\(\) => generation === sessionGeneration,\s*\)/);
 	});
 });
 
@@ -523,10 +544,11 @@ describe("buildDefaultConfig", () => {
 		assert.equal(config.groups.bk, "on-demand");
 	});
 
-	it("has version 1", () => {
+	it("creates version 2 profiles", () => {
 		const groups = categorizeTools(MOCK_TOOLS);
-		const config = buildDefaultConfig(groups);
-		assert.equal(config.version, 1);
+		const config = buildDefaultConfig(groups, { toolHash: computeToolHash(MOCK_TOOLS) });
+		assert.equal(config.version, 2);
+		assert.deepEqual(config.profiles?.[computeToolHash(MOCK_TOOLS)]?.toolGroups, groups);
 	});
 });
 
@@ -696,6 +718,27 @@ describe("watchForAsyncTools", () => {
 
 // ─── Profile Config Migration ─────────────────────────────────────────────────
 
+describe("getInitialToolGroups", () => {
+	it("keeps the last activated profile until the inventory settles", () => {
+		const groups = [{ name: "vault", displayName: "Vault", description: "Vault tools", tools: ["vault_search"] }];
+		const config: LazyToolsConfig = {
+			version: 2,
+			groups: { vault: "always" },
+			toolGroups: groups,
+			profiles: {},
+		};
+
+		assert.deepEqual(getInitialToolGroups(config, [{ name: "read" }]), groups);
+	});
+
+	it("prefix-categorizes when no cached profile exists", () => {
+		const config: LazyToolsConfig = { version: 2, groups: {}, profiles: {} };
+		const currentTools = [{ name: "vault_search" }];
+
+		assert.deepEqual(getInitialToolGroups(config, currentTools), categorizeTools(currentTools));
+	});
+});
+
 describe("profile config migration", () => {
 	it("moves a legacy cache into a hash-keyed profile without losing its active projection", () => {
 		const legacy: LazyToolsConfig = {
@@ -718,6 +761,88 @@ describe("profile config migration", () => {
 		});
 		assert.deepEqual(result.config.groups, legacy.groups);
 		assert.deepEqual(result.config.toolGroups, legacy.toolGroups);
+	});
+
+	it("restores each inventory profile when a previous tool set returns", () => {
+		const legacy: LazyToolsConfig = {
+			version: 1,
+			groups: { core: "always", vault: "on-demand" },
+			toolHash: "tools-a",
+			toolGroups: [
+				{ name: "core", displayName: "Core", description: "Core tools", tools: ["read"] },
+				{ name: "vault", displayName: "Vault", description: "Vault tools", tools: ["vault_search"] },
+			],
+		};
+		const { config } = migrateConfigToProfiles(legacy);
+		const withWorld = saveToolProfile(
+			config,
+			"tools-b",
+			{ core: "always", world: "on-demand" },
+			[{ name: "world", displayName: "World", description: "World tools", tools: ["worldgrep"] }],
+		);
+
+		const restored = activateToolProfile(withWorld, "tools-a");
+
+		assert.ok(restored);
+		assert.equal(restored.toolHash, "tools-a");
+		assert.deepEqual(restored.groups, legacy.groups);
+		assert.deepEqual(restored.toolGroups, legacy.toolGroups);
+		assert.deepEqual(restored.profiles?.["tools-b"], {
+			groups: { core: "always", world: "on-demand" },
+			toolGroups: [{ name: "world", displayName: "World", description: "World tools", tools: ["worldgrep"] }],
+		});
+	});
+
+	it("keeps the active profile when a stale wizard saves its displayed profile", () => {
+		const aGroups = [{ name: "core", displayName: "Core", description: "Core tools", tools: ["read"] }];
+		const bGroups = [{ name: "world", displayName: "World", description: "World tools", tools: ["worldgrep"] }];
+		const config = saveToolProfile(
+			{ version: 2, groups: {}, profiles: {} },
+			"tools-b",
+			{ world: "always" },
+			bGroups,
+		);
+
+		const saved = saveToolProfile(
+			config,
+			"tools-a",
+			{ core: "off" },
+			aGroups,
+			{ activate: false },
+		);
+
+		assert.equal(saved.toolHash, "tools-b");
+		assert.deepEqual(saved.groups, { world: "always" });
+		assert.deepEqual(saved.toolGroups, bGroups);
+		assert.deepEqual(saved.profiles?.["tools-a"], {
+			groups: { core: "off" },
+			toolGroups: aGroups,
+		});
+	});
+
+	it("round-trips every inventory profile through config persistence", () => {
+		const { config } = migrateConfigToProfiles({
+			version: 1,
+			groups: { core: "always" },
+			toolHash: "tools-a",
+			toolGroups: [{ name: "core", displayName: "Core", description: "Core tools", tools: ["read"] }],
+		});
+		const withWorld = saveToolProfile(
+			config,
+			"tools-b",
+			{ core: "always", world: "on-demand" },
+			[{ name: "world", displayName: "World", description: "World tools", tools: ["worldgrep"] }],
+		);
+		const dir = mkdtempSync(join(tmpdir(), "lazy-tools-profiles-"));
+		const path = join(dir, "config.json");
+
+		try {
+			saveConfigToPath(path, withWorld);
+			const loaded = loadConfigFromPath(path)!;
+			assert.deepEqual(loaded.profiles, withWorld.profiles);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -1172,6 +1297,25 @@ describe("shouldPassthrough", () => {
 });
 
 // ─── shouldBackgroundCategorize ────────────────────────────────────────
+
+describe("shouldUseInitialPassthrough", () => {
+	it("passes through a fresh spawned session before setup can open", () => {
+		assert.equal(shouldUseInitialPassthrough(null, "tui", { PI_TEAM_ROLE: "teammate" }), true);
+	});
+
+	it("passes through a fresh noninteractive session", () => {
+		assert.equal(shouldUseInitialPassthrough(null, "print", {}), true);
+	});
+
+	it("keeps interactive first setup for a human session", () => {
+		assert.equal(shouldUseInitialPassthrough(null, "tui", {}), false);
+	});
+
+	it("keeps configured passthrough opt-in after setup", () => {
+		const config = makeConfig();
+		assert.equal(shouldUseInitialPassthrough(config, "rpc", {}), false);
+	});
+});
 
 describe("shouldBackgroundCategorize", () => {
 	it("returns false when the config is undefined", () => {

@@ -88,6 +88,10 @@ export interface CategorizationConfig {
 	guidance?: string;
 }
 
+function cloneToolGroups(toolGroups: ToolGroup[]): ToolGroup[] {
+	return toolGroups.map((group) => ({ ...group, tools: [...group.tools] }));
+}
+
 export function migrateConfigToProfiles(
 	config: LazyToolsConfig,
 ): { config: LazyToolsConfig; migrated: boolean } {
@@ -97,7 +101,7 @@ export function migrateConfigToProfiles(
 	if (config.toolHash && config.toolGroups) {
 		profiles[config.toolHash] = {
 			groups: { ...config.groups },
-			toolGroups: config.toolGroups.map((group) => ({ ...group, tools: [...group.tools] })),
+			toolGroups: cloneToolGroups(config.toolGroups),
 		};
 	}
 
@@ -105,6 +109,52 @@ export function migrateConfigToProfiles(
 		config: { ...config, version: 2, profiles },
 		migrated: true,
 	};
+}
+
+export function saveToolProfile(
+	config: LazyToolsConfig,
+	toolHash: string,
+	groups: Record<string, GroupMode>,
+	toolGroups: ToolGroup[],
+	options?: { activate?: boolean },
+): LazyToolsConfig {
+	const profile = { groups: { ...groups }, toolGroups: cloneToolGroups(toolGroups) };
+	const profiles = { ...config.profiles, [toolHash]: profile };
+	if (options?.activate === false) {
+		return { ...config, version: 2, profiles };
+	}
+	return {
+		...config,
+		version: 2,
+		groups: { ...profile.groups },
+		toolHash,
+		toolGroups: cloneToolGroups(profile.toolGroups),
+		profiles,
+	};
+}
+
+export function activateToolProfile(
+	config: LazyToolsConfig,
+	toolHash: string,
+): LazyToolsConfig | null {
+	const profile = config.profiles?.[toolHash];
+	if (!profile) return null;
+	return {
+		...config,
+		version: 2,
+		groups: { ...profile.groups },
+		toolHash,
+		toolGroups: cloneToolGroups(profile.toolGroups),
+	};
+}
+
+export function getInitialToolGroups(
+	config: LazyToolsConfig,
+	currentTools: ToolLike[],
+): ToolGroup[] {
+	return config.toolGroups
+		? cloneToolGroups(config.toolGroups)
+		: categorizeTools(currentTools);
 }
 
 // ─── Prompt-based Group Detection ────────────────────────────────────────────
@@ -562,6 +612,16 @@ export function shouldPassthrough(
 	});
 }
 
+export function shouldUseInitialPassthrough(
+	config: LazyToolsConfig | null,
+	mode: string,
+	env: Record<string, string | undefined>,
+): boolean {
+	return config
+		? shouldPassthrough(config.passthrough, mode, env)
+		: shouldPassthrough({ enabled: true }, mode, env);
+}
+
 /**
  * Decide whether the tool-set-changed and first-run categorization should run
  * off the awaited startup path. Returns false unless explicitly enabled, so
@@ -787,6 +847,13 @@ export function loadConfigFromPath(path: string): LazyToolsConfig | null {
 		if (config?.toolGroups && !Array.isArray(config.toolGroups)) {
 			config.toolGroups = decodeToolGroups(config.toolGroups as unknown as EncodedToolGroups);
 		}
+		if (config?.profiles) {
+			for (const profile of Object.values(config.profiles)) {
+				if (!Array.isArray(profile.toolGroups)) {
+					profile.toolGroups = decodeToolGroups(profile.toolGroups as unknown as EncodedToolGroups);
+				}
+			}
+		}
 		return config;
 	} catch {
 		return null;
@@ -827,11 +894,15 @@ export function saveConfigToPath(path: string, config: LazyToolsConfig): void {
  * document when there is no toolGroups to set apart.
  */
 function serializeConfig(config: LazyToolsConfig): string {
-	const { toolGroups, ...rest } = config;
+	const { toolGroups, profiles, ...rest } = config;
+	const cachedFields = [
+		profiles && `"profiles": ${JSON.stringify(encodeProfiles(profiles))}`,
+		toolGroups && `"toolGroups": ${JSON.stringify(encodeToolGroups(toolGroups))}`,
+	].filter((field): field is string => Boolean(field));
+	if (cachedFields.length === 0) return JSON.stringify(rest, null, 2);
+
 	const restStr = JSON.stringify(rest, null, 2);
-	if (toolGroups === undefined) return restStr;
-	// restStr ends with "\n}"; splice toolGroups in compact before the closing brace.
-	return `${restStr.slice(0, -2)},\n  "toolGroups": ${JSON.stringify(encodeToolGroups(toolGroups))}\n}`;
+	return `${restStr.slice(0, -1)},\n  ${cachedFields.join(",\n  ")}\n}`;
 }
 
 /**
@@ -873,6 +944,13 @@ function decodeToolGroups(enc: EncodedToolGroups): ToolGroup[] {
 		});
 	}
 	return groups;
+}
+
+function encodeProfiles(profiles: Record<string, ToolProfile>): Record<string, Omit<ToolProfile, "toolGroups"> & { toolGroups: EncodedToolGroups }> {
+	return Object.fromEntries(Object.entries(profiles).map(([toolHash, profile]) => [
+		toolHash,
+		{ groups: profile.groups, toolGroups: encodeToolGroups(profile.toolGroups) },
+	]));
 }
 
 // ─── Config Reconciliation ──────────────────────────────────────────────────
@@ -962,13 +1040,15 @@ export function buildDefaultConfig(
 	for (const group of toolGroups) {
 		groups[group.name] = "on-demand";
 	}
-	return {
-		version: 1,
+	const config: LazyToolsConfig = {
+		version: 2,
 		groups,
+		profiles: {},
 		...(opts?.model && { categorizationModel: opts.model }),
-		...(opts?.toolHash && { toolHash: opts.toolHash }),
-		...(toolGroups.length > 0 && { toolGroups }),
 	};
+	return opts?.toolHash && toolGroups.length > 0
+		? saveToolProfile(config, opts.toolHash, groups, toolGroups)
+		: config;
 }
 
 /**
@@ -1011,12 +1091,7 @@ export function mergeGroupsIntoConfig(
 	const modes: Record<string, GroupMode> = config.preserveModesBySignature
 		? mergeModesBySignature(config, newGroups)
 		: mergeModesByName(config.groups, newGroups);
-	return {
-		...config,
-		groups: modes,
-		toolHash,
-		toolGroups: newGroups,
-	};
+	return saveToolProfile(config, toolHash, modes, newGroups);
 }
 
 /** Name-keyed merge: preserve modes for same-named groups, drop stale ones. */
