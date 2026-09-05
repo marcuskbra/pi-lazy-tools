@@ -40,6 +40,7 @@ import {
 	activateToolProfile,
 	saveToolProfile,
 	getInitialToolGroups,
+	normalizeActiveToolGatewayProfile,
 	GroupIndex,
 	computeToolHash,
 	buildCategorizationPrompt,
@@ -809,8 +810,9 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 
 		if (config) {
 			const migration = migrateConfigToProfiles(config);
-			config = migration.config;
-			if (migration.migrated) saveConfigToPath(getConfigPath(), config);
+			const normalization = normalizeActiveToolGatewayProfile(migration.config);
+			config = normalization.config;
+			if (migration.migrated || normalization.normalized) saveConfigToPath(getConfigPath(), config);
 		}
 
 		// Restore session-activated groups from branch
@@ -853,11 +855,13 @@ export default function lazyToolsExtension(pi: ExtensionAPI) {
 
 					const allTools = pi.getAllTools();
 					const stableHash = computeToolHash(allTools);
+					const activationChanged = config!.toolHash !== stableHash;
 					const profile = activateToolProfile(config!, stableHash);
 					if (profile) {
-						config = profile;
-						toolGroups = profile.toolGroups ?? [];
-						saveConfigToPath(getConfigPath(), config);
+						const normalization = normalizeActiveToolGatewayProfile(profile);
+						config = normalization.config;
+						toolGroups = config.toolGroups ?? [];
+						if (activationChanged || normalization.normalized) saveConfigToPath(getConfigPath(), config);
 					} else {
 						const recategorized = await runLlmCategorization(
 							ctx,

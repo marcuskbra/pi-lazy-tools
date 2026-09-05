@@ -38,6 +38,7 @@ import {
 	saveToolProfile,
 	activateToolProfile,
 	getInitialToolGroups,
+	normalizeActiveToolGatewayProfile,
 	inheritModeBySignature,
 	type ToolLike,
 	type ToolGroup,
@@ -75,8 +76,9 @@ describe("categorization runtime", () => {
 		assert.match(lazyToolsExtensionSource, /withDebugLogging\(config, debugLogging\)/);
 	});
 
-	it("saves the active profile projection after profile restoration", () => {
-		assert.match(lazyToolsExtensionSource, /toolGroups = profile\.toolGroups \?\? \[\];\s*saveConfigToPath\(getConfigPath\(\), config\);/);
+	it("writes restored profiles only when they change", () => {
+		assert.match(lazyToolsExtensionSource, /const activationChanged = config!\.toolHash !== stableHash;/);
+		assert.match(lazyToolsExtensionSource, /if \(activationChanged \|\| normalization\.normalized\) saveConfigToPath\(getConfigPath\(\), config\);/);
 	});
 
 	it("guards first-run categorization and snapshots wizard profile data", () => {
@@ -739,6 +741,30 @@ describe("getInitialToolGroups", () => {
 	});
 });
 
+describe("Tool Gateway normalization", () => {
+	it("normalizes the active profile and preserves its source mode", () => {
+		const profile = {
+			groups: { admin: "off" as const },
+			toolGroups: [{ name: "admin", displayName: "Admin", description: "Admin tools", tools: ["tool_gateway_describe", "tool_gateway_list_backends"] }],
+		};
+		const config: LazyToolsConfig = { version: 2, ...profile, toolHash: "current", profiles: { current: profile } };
+		const result = normalizeActiveToolGatewayProfile(config);
+
+		assert.equal(result.normalized, true);
+		assert.deepEqual(result.config.groups, { tool_gateway: "off" });
+		assert.deepEqual(result.config.toolGroups, [{ name: "tool_gateway", displayName: "Tool Gateway", description: "Discover, configure, and run Tool Gateway tools.", tools: ["tool_gateway_describe", "tool_gateway_list_backends"] }]);
+	});
+
+	it("leaves an already canonical active profile unchanged", () => {
+		const profile = { groups: { tool_gateway: "always" as const }, toolGroups: [{ name: "tool_gateway", displayName: "Tool Gateway", description: "Discover, configure, and run Tool Gateway tools.", tools: ["tool_gateway_search_tools"] }] };
+		const config: LazyToolsConfig = { version: 2, ...profile, toolHash: "current", profiles: { current: profile } };
+		const result = normalizeActiveToolGatewayProfile(config);
+
+		assert.equal(result.normalized, false);
+		assert.equal(result.config, config);
+	});
+});
+
 describe("profile config migration", () => {
 	it("moves a legacy cache into a hash-keyed profile without losing its active projection", () => {
 		const legacy: LazyToolsConfig = {
@@ -1094,16 +1120,15 @@ describe("LLM categorization helpers", () => {
 		assert.ok(prompt.includes("Search vault"));
 	});
 
-	it("parseCategorizationResponse parses valid JSON", () => {
-		const response = JSON.stringify({
-			groups: [
-				{ name: "core", displayName: "Core", description: "Core tools", tools: ["read"] },
-				{ name: "vault", displayName: "Vault", description: "Vault tools", tools: ["vault_search"] },
-			],
-		});
-		const result = parseCategorizationResponse(response, ["read", "vault_search"]);
+	it("parseCategorizationResponse canonicalizes Tool Gateway tools", () => {
+		const tools = ["tool_gateway_search_tools", "tool_gateway_describe", "tool_gateway_run_tool", "tool_gateway_list_backends", "tool_gateway_enable_backend", "tool_gateway_disable_backend"];
+		const response = JSON.stringify({ groups: [
+			{ name: "tool_gateway", displayName: "Tool Gateway", description: "Discovery", tools: [...tools.slice(0, 3), "read"] },
+			{ name: "tool", displayName: "Tool", description: "Administration", tools: tools.slice(3) },
+		] });
+		const result = parseCategorizationResponse(response, [...tools, "read"]);
 		assert.ok(result);
-		assert.equal(result!.length, 2);
+		assert.deepEqual(result![0].tools, [...tools.slice(0, 3), "read", ...tools.slice(3)]);
 	});
 
 	it("parseCategorizationResponse assigns missing tools to core", () => {

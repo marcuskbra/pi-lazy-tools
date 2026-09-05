@@ -88,8 +88,68 @@ export interface CategorizationConfig {
 	guidance?: string;
 }
 
+const TOOL_GATEWAY_GROUP: Omit<ToolGroup, "tools"> = {
+	name: "tool_gateway",
+	displayName: "Tool Gateway",
+	description: "Discover, configure, and run Tool Gateway tools.",
+};
+
 function cloneToolGroups(toolGroups: ToolGroup[]): ToolGroup[] {
 	return toolGroups.map((group) => ({ ...group, tools: [...group.tools] }));
+}
+
+function isToolGatewayTool(toolName: string): boolean {
+	return toolName.startsWith("tool_gateway_");
+}
+
+function normalizeToolGatewayGroups(toolGroups: ToolGroup[]): ToolGroup[] {
+	const gatewayTools = [...new Set(toolGroups.flatMap((group) =>
+		group.name === TOOL_GATEWAY_GROUP.name ? group.tools : group.tools.filter(isToolGatewayTool),
+	))];
+	if (gatewayTools.length === 0) return toolGroups;
+
+	let inserted = false;
+	const normalizedGroups = toolGroups.flatMap((group) => {
+		const containsGatewayTools = group.tools.some(isToolGatewayTool);
+		const remainingTools = group.name === TOOL_GATEWAY_GROUP.name ? [] : group.tools.filter((tool) => !isToolGatewayTool(tool));
+		const normalized = !inserted && (group.name === TOOL_GATEWAY_GROUP.name || containsGatewayTools)
+			? (inserted = true, [{ ...TOOL_GATEWAY_GROUP, tools: gatewayTools }])
+			: [];
+		return [...normalized, ...(remainingTools.length > 0 ? [{ ...group, tools: remainingTools }] : [])];
+	});
+	return JSON.stringify(normalizedGroups) === JSON.stringify(toolGroups) ? toolGroups : normalizedGroups;
+}
+
+function getToolGatewayMode(profile: ToolProfile): GroupMode {
+	if (profile.groups.tool_gateway) return profile.groups.tool_gateway;
+
+	let sourceMode: GroupMode | undefined;
+	let sourceToolCount = 0;
+	for (const group of profile.toolGroups) {
+		const toolCount = group.tools.filter(isToolGatewayTool).length;
+		if (toolCount > sourceToolCount && profile.groups[group.name]) {
+			sourceMode = profile.groups[group.name];
+			sourceToolCount = toolCount;
+		}
+	}
+	return sourceMode ?? "on-demand";
+}
+
+export function normalizeActiveToolGatewayProfile(
+	config: LazyToolsConfig,
+): { config: LazyToolsConfig; normalized: boolean } {
+	const profile = config.toolHash && config.profiles?.[config.toolHash];
+	if (!profile) return { config, normalized: false };
+
+	const toolGroups = normalizeToolGatewayGroups(profile.toolGroups);
+	if (toolGroups === profile.toolGroups) return { config, normalized: false };
+	const groups = mergeModesByName(profile.groups, toolGroups);
+	groups.tool_gateway = getToolGatewayMode(profile);
+	const normalizedProfile = { groups, toolGroups };
+	return {
+		config: { ...config, groups, toolGroups, profiles: { ...config.profiles, [config.toolHash!]: normalizedProfile } },
+		normalized: true,
+	};
 }
 
 export function migrateConfigToProfiles(
@@ -381,7 +441,7 @@ export function categorizeTools(allTools: ToolLike[]): ToolGroup[] {
 	}
 
 	ensureCoreTools(result);
-	return result;
+	return normalizeToolGatewayGroups(result);
 }
 
 // ─── LLM-based Categorization ────────────────────────────────────────────────
@@ -525,7 +585,7 @@ export function parseCategorizationResponse(response: string, allToolNames: stri
 		}
 
 		ensureCoreTools(groups);
-		return groups;
+		return normalizeToolGatewayGroups(groups);
 	} catch {
 		return null;
 	}
